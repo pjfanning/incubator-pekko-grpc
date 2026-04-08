@@ -164,7 +164,13 @@ lazy val sbtPlugin = Project(id = "sbt-plugin", base = file("sbt-plugin"))
   .settings(Dependencies.sbtPlugin)
   .settings(
     name := s"$pekkoPrefix-sbt-plugin",
-    sbtPluginPublishLegacyMavenStyle := true,
+    pluginCrossBuild / sbtVersion := {
+      scalaBinaryVersion.value match {
+        case "2.12" => "1.12.9"
+        case _      => "2.0.0-RC11"
+      }
+    },
+    sbtPluginPublishLegacyMavenStyle := (scalaBinaryVersion.value == "2.12"),
     /** And for scripted tests: */
     scriptedLaunchOpts += ("-Dproject.version=" + version.value),
     scriptedLaunchOpts ++= sys.props.collect { case (k @ "sbt.ivy.home", v) => s"-D$k=$v" }.toSeq,
@@ -174,7 +180,12 @@ lazy val sbtPlugin = Project(id = "sbt-plugin", base = file("sbt-plugin"))
       val p3 = (runtime / publishLocal).value
       val p4 = (interopTests / publishLocal).value
     },
-    scriptedSbt := "1.12.0",
+    scriptedSbt := {
+      scalaBinaryVersion.value match {
+        case "2.12" => "1.12.9"
+        case _      => "2.0.0-RC11"
+      }
+    },
     scriptedBufferLog := false)
   .settings(
     crossScalaVersions := Dependencies.Versions.CrossScalaForPlugin,
