@@ -1,0 +1,4 @@
+> compile
+
+$ exists target/scala-3.3.7/pekko-grpc/main/example/myapp/helloworld/grpc/HelloRequest.scala
+$ exists target/scala-3.3.7/pekko-grpc/main/example/myapp/helloworld/grpc/GreeterService.scala
