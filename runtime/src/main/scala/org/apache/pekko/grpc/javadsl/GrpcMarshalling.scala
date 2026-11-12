@@ -38,13 +38,50 @@ object GrpcMarshalling {
   def negotiated[T](
       req: HttpRequest,
       f: (GrpcProtocolReader, GrpcProtocolWriter) => CompletionStage[T]): Optional[CompletionStage[T]] =
+    negotiated(req, GrpcServerSettings.defaults, f)
+
+  /**
+   * Negotiates the gRPC protocol for a server handler with the given settings.
+   *
+   * The settings carry the handler-scoped configuration (currently the maximum inbound
+   * message size), so that further configuration can be added without another entry point here.
+   */
+  def negotiated[T](
+      req: HttpRequest,
+      settings: GrpcServerSettings,
+      f: (GrpcProtocolReader, GrpcProtocolWriter) => CompletionStage[T]): Optional[CompletionStage[T]] =
     GrpcProtocol
-      .negotiate(req)
+      .negotiate(req, settings)
       .map {
         case (maybeReader, writer) =>
           maybeReader.map(reader => f(reader, writer)).fold[CompletionStage[T]](failure, identity)
       }
       .fold(Optional.empty[CompletionStage[T]])(Optional.of)
+
+  /**
+   * INTERNAL API
+   *
+   * Java API: bounds `response` by the deadline the client asked for in `grpc-timeout`.
+   *
+   * See the scaladsl `GrpcMarshalling.withServerDeadline`.
+   */
+  @InternalApi
+  def withServerDeadline(
+      request: HttpRequest,
+      response: CompletionStage[HttpResponse],
+      system: ClassicActorSystemProvider,
+      writer: GrpcProtocolWriter): CompletionStage[HttpResponse] = {
+    import scala.jdk.FutureConverters._
+    implicit val ec: scala.concurrent.ExecutionContext = system.classicSystem.dispatcher
+    val scalaRequest = request.asInstanceOf[pekko.http.scaladsl.model.HttpRequest]
+    scaladsl.GrpcMarshalling
+      .withServerDeadline(scalaRequest, response.asScala.map(_.asInstanceOf[pekko.http.scaladsl.model.HttpResponse]))(
+        system,
+        writer,
+        ec)
+      .map(r => r: HttpResponse)
+      .asJava
+  }
 
   def unmarshal[T](
       data: Source[ByteString, AnyRef],

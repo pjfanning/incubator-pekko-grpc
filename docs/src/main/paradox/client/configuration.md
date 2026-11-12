@@ -82,6 +82,71 @@ effect and is logged as a warning.
 
 @@@
 
+## Minimum TLS version
+
+By default the client negotiates whichever TLS versions the JDK enables, which on a supported JDK
+is TLSv1.2 and above. To require a higher floor, set `minimum-tls-version`. The accepted values are
+`TLSv1.2` and `TLSv1.3`; any other value is rejected when the settings are created.
+The setting only narrows the versions the JDK enables: it never re-enables a version the JDK has
+disabled, for example through `jdk.tls.client.protocols` or `jdk.tls.disabledAlgorithms`.
+
+```hocon
+pekko.grpc.client."*" {
+  minimum-tls-version = "TLSv1.3"
+}
+```
+
+or programmatically:
+
+Scala
+:   ```scala
+    val settings = GrpcClientSettings.connectToServiceAt("localhost", 8080)
+      .withMinimumTlsVersion("TLSv1.3")
+    ```
+
+Java
+:   ```java
+    GrpcClientSettings settings = GrpcClientSettings.connectToServiceAt("localhost", 8080, system)
+        .withMinimumTlsVersion("TLSv1.3");
+    ```
+
+The setting applies to both the `netty` and the `pekko-http` backend, including when you supply your
+own `SSLContext` with `withSslContext`.
+
+To set a floor for every TLS client in the JVM rather than per gRPC client, the JDK's
+`jdk.tls.client.protocols` system property (for example `-Djdk.tls.client.protocols=TLSv1.3`) does
+that. It only applies to the JDK's own TLS implementation, so it is ignored when the `netty` backend
+uses the OpenSSL provider (`ssl-provider = "openssl"`).
+
+## Maximum inbound message size
+
+Inbound gRPC messages are limited to 4 MiB by default, matching the grpc-java default; larger messages
+are rejected with `RESOURCE_EXHAUSTED`. The limit applies to both the `netty` and the `pekko-http`
+backend, and covers the decompressed size, so a compressed response that inflates past the limit is
+rejected while it is being decompressed.
+
+Set it in configuration:
+
+```hocon
+pekko.grpc.client."*" {
+  max-inbound-message-size = 8388608  # 8 MiB
+}
+```
+
+or programmatically:
+
+Scala
+:   ```scala
+    val settings = GrpcClientSettings.connectToServiceAt("localhost", 8080)
+      .withMaxInboundMessageSize(8 * 1024 * 1024)
+    ```
+
+Java
+:   ```java
+    GrpcClientSettings settings = GrpcClientSettings.connectToServiceAt("localhost", 8080, system)
+        .withMaxInboundMessageSize(8 * 1024 * 1024);
+    ```
+
 ## Using Pekko Discovery for Endpoint Discovery
 
 The examples above all use a hard coded host and port for the location of the gRPC service which is the default if you do not configure a `service-discovery-mechanism`.

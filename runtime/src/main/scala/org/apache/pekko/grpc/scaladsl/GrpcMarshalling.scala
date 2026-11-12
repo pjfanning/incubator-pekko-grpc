@@ -16,7 +16,8 @@ package org.apache.pekko.grpc.scaladsl
 import io.grpc.Status
 
 import scala.annotation.nowarn
-import scala.concurrent.{ ExecutionContext, Future }
+import scala.concurrent.{ ExecutionContext, Future, Promise }
+import scala.concurrent.duration._
 import scala.util.{ Failure, Success, Try }
 import scala.util.control.NonFatal
 
@@ -29,6 +30,7 @@ import pekko.grpc._
 import pekko.grpc.GrpcProtocol.{ GrpcProtocolReader, GrpcProtocolWriter }
 import pekko.grpc.internal._
 import pekko.http.scaladsl.model.{ HttpEntity, HttpRequest, HttpResponse, Uri }
+import pekko.http.scaladsl.model.HttpEntity.ChunkStreamPart
 import pekko.http.scaladsl.util.FastFuture
 import pekko.stream.Materializer
 import pekko.stream.scaladsl.Source
@@ -54,10 +56,89 @@ object GrpcMarshalling {
       }).getOrElse(throw new GrpcServiceException(Status.UNIMPLEMENTED))
   }
 
+  /**
+   * INTERNAL API
+   *
+   * Bounds `response` by the deadline the client asked for in `grpc-timeout`.
+   *
+   * If `response` has not completed by the deadline, a `DEADLINE_EXCEEDED` response is sent
+   * instead. The handler's `Future` cannot be cancelled, so the handler still runs to completion,
+   * but its result is discarded.
+   *
+   * If `response` completes in time with a streamed (chunked) body, the rest of the body is bounded
+   * by what remains of the deadline: on expiry the body ends with `DEADLINE_EXCEEDED` trailers and
+   * the stream producing it is cancelled, which stops the server-side work.
+   *
+   * The deadline's timer is cancelled as soon as it is no longer needed. A request with no
+   * `grpc-timeout`, or an unparseable one, is left unbounded.
+   */
+  @InternalApi
+  def withServerDeadline(request: HttpRequest, response: Future[HttpResponse])(
+      implicit system: ClassicActorSystemProvider,
+      writer: GrpcProtocolWriter,
+      ec: ExecutionContext): Future[HttpResponse] =
+    headers.`Timeout`.findIn(request.headers) match {
+      case None           => response
+      case Some(deadline) =>
+        val start = System.nanoTime()
+        val deadlineExceeded = Status.DEADLINE_EXCEEDED.withDescription(s"Deadline of $deadline exceeded")
+        val result = Promise[HttpResponse]()
+        val timer = system.classicSystem.scheduler.scheduleOnce(deadline) {
+          result.trySuccess(GrpcResponseHelpers.status(Trailers(deadlineExceeded)))
+        }
+        response.onComplete { completed =>
+          timer.cancel()
+          val remaining = deadline - (System.nanoTime() - start).nanos
+          result.tryComplete(completed.map(boundBody(_, remaining, deadlineExceeded)))
+        }
+        result.future
+    }
+
+  /**
+   * Ends a chunked gRPC body with `DEADLINE_EXCEEDED` trailers once `remaining` has passed,
+   * cancelling the source that produces the body.
+   */
+  private def boundBody(response: HttpResponse, remaining: FiniteDuration, deadlineExceeded: Status)(
+      implicit writer: GrpcProtocolWriter): HttpResponse =
+    response.entity match {
+      case HttpEntity.Chunked(contentType, chunks) =>
+        val timedOut: ChunkStreamPart = writer.encodeFrame(GrpcEntityHelpers.trailer(deadlineExceeded))
+        val bounded = chunks
+          .map(Option(_))
+          // `None` marks the deadline; the timer is cancelled when the body completes first
+          .merge(Source.single[Option[ChunkStreamPart]](None).initialDelay(remaining.max(Duration.Zero)),
+            eagerComplete = true)
+          .statefulMap(() => false)(
+            {
+              // the body has already sent its trailers, so the deadline no longer applies
+              case (true, _)        => (true, Nil)
+              case (false, Some(c)) => (c.isLastChunk, c :: Nil)
+              case (false, None)    => (true, timedOut :: Nil)
+            },
+            _ => None)
+          .mapConcat(identity)
+          // completing here cancels the body's source
+          .takeWhile(_ ne timedOut, inclusive = true)
+        response.withEntity(HttpEntity.Chunked(contentType, bounded))
+      case _ => response
+    }
+
   def negotiated[T](req: HttpRequest, f: (GrpcProtocolReader, GrpcProtocolWriter) => Future[T]): Option[Future[T]] =
-    GrpcProtocol.negotiate(req).map {
+    negotiated(req, GrpcServerSettings.defaults, f)
+
+  /**
+   * Negotiates the gRPC protocol for a server handler with the given settings.
+   *
+   * The settings carry the handler-scoped configuration (currently the maximum inbound
+   * message size), so that further configuration can be added without another entry point here.
+   */
+  def negotiated[T](
+      req: HttpRequest,
+      settings: GrpcServerSettings,
+      f: (GrpcProtocolReader, GrpcProtocolWriter) => Future[T]): Option[Future[T]] =
+    GrpcProtocol.negotiate(req, settings).map {
       case (Success(reader), writer) => f(reader, writer)
-      case (Failure(ex), _)          => Future.failed(ex)
+      case (Failure(ex), _)          => FastFuture.failed(ex)
     }
 
   def unmarshal[T](data: Source[ByteString, Any])(
@@ -69,7 +150,7 @@ object GrpcMarshalling {
   def unmarshal[T](
       entity: HttpEntity)(implicit u: ProtobufSerializer[T], mat: Materializer, reader: GrpcProtocolReader): Future[T] =
     entity match {
-      case HttpEntity.Strict(_, data) => Future.fromTry(Try(u.deserialize(reader.decodeSingleFrame(data))))
+      case HttpEntity.Strict(_, data) => FastFuture(Try(u.deserialize(reader.decodeSingleFrame(data))))
       case _                          => unmarshal(entity.dataBytes)
     }
 
@@ -77,7 +158,7 @@ object GrpcMarshalling {
       implicit u: ProtobufSerializer[T],
       @nowarn("msg=is never used") mat: Materializer,
       reader: GrpcProtocolReader): Future[Source[T, NotUsed]] = {
-    Future.successful(
+    FastFuture.successful(
       data
         .mapMaterializedValue(_ => NotUsed)
         .via(reader.dataFrameDecoder)

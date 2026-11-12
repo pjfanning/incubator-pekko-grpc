@@ -31,16 +31,16 @@ jobs:
           fetch-depth: 0
 
       - name: Setup Java 17
-        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
         with:
           distribution: temurin
           java-version: 17
 
       - name: Install sbt
-        uses: sbt/setup-sbt@c7d2d6258b4bd0d3ec5129e6b3453199d3c79729 # v1.5.8
+        uses: sbt/setup-sbt@67d461eba2c4753196c230e02da850757ba4775e # v1.5.14
 
       - name: Cache Coursier cache
-        uses: coursier/cache-action@95e5b1029b6b86e7bac033ee44a0697d8a527d2d # v8.1.1
+        uses: coursier/cache-action@ee0650f98295f27a505e4bfd284c9bfaa913a465 # v9.0.1
 
       - name: Code style check
         run: |-
@@ -50,7 +50,12 @@ jobs:
       - name: Binary-compatibility check
         run: |-
           cp .jvmopts-ci .jvmopts
-          sbt grpcVersionSyncCheck googleProtobufVersionSyncCheck mimaReportBinaryIssues
+          sbt grpcVersionSyncCheck googleProtobufVersionSyncCheck +runtime/mimaReportBinaryIssues
+
+      - name: Assembly license check
+        run: |-
+          cp .jvmopts-ci .jvmopts
+          sbt checkAssemblyLicenses
 
   compile-benchmarks:
     name: Compile Benchmarks
@@ -63,16 +68,16 @@ jobs:
           fetch-depth: 0
 
       - name: Setup Java 17
-        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
         with:
           distribution: temurin
           java-version: 17
 
       - name: Install sbt
-        uses: sbt/setup-sbt@c7d2d6258b4bd0d3ec5129e6b3453199d3c79729 # v1.5.8
+        uses: sbt/setup-sbt@67d461eba2c4753196c230e02da850757ba4775e # v1.5.14
 
       - name: Cache Coursier cache
-        uses: coursier/cache-action@95e5b1029b6b86e7bac033ee44a0697d8a527d2d # v8.1.1
+        uses: coursier/cache-action@ee0650f98295f27a505e4bfd284c9bfaa913a465 # v9.0.1
 
       - name: Compile benchmarks
         run: |-
@@ -94,16 +99,16 @@ jobs:
           fetch-depth: 0
 
       - name: Setup Java ${{ matrix.JAVA_VERSION }}
-        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
         with:
           distribution: temurin
           java-version: ${{ matrix.JAVA_VERSION }}
 
       - name: Install sbt
-        uses: sbt/setup-sbt@c7d2d6258b4bd0d3ec5129e6b3453199d3c79729 # v1.5.8
+        uses: sbt/setup-sbt@67d461eba2c4753196c230e02da850757ba4775e # v1.5.14
 
       - name: Cache Coursier cache
-        uses: coursier/cache-action@95e5b1029b6b86e7bac033ee44a0697d8a527d2d # v8.1.1
+        uses: coursier/cache-action@ee0650f98295f27a505e4bfd284c9bfaa913a465 # v9.0.1
 
       - name: Compile and test for JDK ${{ matrix.JAVA_VERSION }}, Scala ${{ matrix.SCALA_VERSION }}
         run: |-
@@ -122,7 +127,7 @@ jobs:
           - test-set: gen-scala-server
             scala-version: 2.13
           - test-set: scala3
-            scala-version: next
+            scala-version: sbt-plugin-scala3
           - test-set: gen-java
             scala-version: 2.13
     steps:
@@ -132,13 +137,13 @@ jobs:
           fetch-depth: 0
 
       - name: Setup Java 17
-        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
         with:
           distribution: temurin
           java-version: 17
 
       - name: Install sbt
-        uses: sbt/setup-sbt@c7d2d6258b4bd0d3ec5129e6b3453199d3c79729 # v1.5.8
+        uses: sbt/setup-sbt@67d461eba2c4753196c230e02da850757ba4775e # v1.5.14
 
       - name: Install go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -149,12 +154,12 @@ jobs:
         run: go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.32.0
 
       - name: Cache Coursier cache
-        uses: coursier/cache-action@95e5b1029b6b86e7bac033ee44a0697d8a527d2d # v8.1.1
+        uses: coursier/cache-action@ee0650f98295f27a505e4bfd284c9bfaa913a465 # v9.0.1
 
       - name: Scripted ${{ matrix.test-set }}
         run: |-
           cp .jvmopts-ci .jvmopts
-          if [ "${{ matrix.scala-version }}" = "next" ]; then
+          if [ "${{ matrix.scala-version }}" = "sbt-plugin-scala3" ]; then
             scala_version="$(bash .github/scripts/resolve-scala-version.sh "${{ matrix.scala-version }}")"
             sbt "++${scala_version}!" "sbt-plugin/scripted ${{ matrix.test-set }}/*"
           else
@@ -171,16 +176,16 @@ jobs:
           fetch-depth: 0
 
       - name: Setup Java 17
-        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
         with:
           distribution: temurin
           java-version: 17
 
       - name: Install sbt
-        uses: sbt/setup-sbt@c7d2d6258b4bd0d3ec5129e6b3453199d3c79729 # v1.5.8
+        uses: sbt/setup-sbt@67d461eba2c4753196c230e02da850757ba4775e # v1.5.14
 
       - name: Cache Coursier cache
-        uses: coursier/cache-action@95e5b1029b6b86e7bac033ee44a0697d8a527d2d # v8.1.1
+        uses: coursier/cache-action@ee0650f98295f27a505e4bfd284c9bfaa913a465 # v9.0.1
 
       - name: Gather version
         run: |-
@@ -230,16 +235,16 @@ jobs:
           fetch-depth: 0
 
       - name: Setup Java 17
-        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
         with:
           distribution: temurin
           java-version: 17
 
       - name: Install sbt
-        uses: sbt/setup-sbt@c7d2d6258b4bd0d3ec5129e6b3453199d3c79729 # v1.5.8
+        uses: sbt/setup-sbt@67d461eba2c4753196c230e02da850757ba4775e # v1.5.14
 
       - name: Cache Coursier cache
-        uses: coursier/cache-action@95e5b1029b6b86e7bac033ee44a0697d8a527d2d # v8.1.1
+        uses: coursier/cache-action@ee0650f98295f27a505e4bfd284c9bfaa913a465 # v9.0.1
 
       - name: Gather version
         run: |-
@@ -279,16 +284,16 @@ jobs:
           fetch-depth: 0
 
       - name: Setup Java 17
-        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
         with:
           distribution: temurin
           java-version: 17
 
       - name: Install sbt
-        uses: sbt/setup-sbt@c7d2d6258b4bd0d3ec5129e6b3453199d3c79729 # v1.5.8
+        uses: sbt/setup-sbt@67d461eba2c4753196c230e02da850757ba4775e # v1.5.14
 
       - name: Cache Coursier cache
-        uses: coursier/cache-action@95e5b1029b6b86e7bac033ee44a0697d8a527d2d # v8.1.1
+        uses: coursier/cache-action@ee0650f98295f27a505e4bfd284c9bfaa913a465 # v9.0.1
 
       - name: Build Paradox Docs
         run: |-

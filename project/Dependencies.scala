@@ -19,13 +19,18 @@ object Dependencies {
     // Update the .github workflows when these scala versions change
     val scala212 = "2.12.21"
     val scala213 = "2.13.18"
-    val scala3 = "3.3.8"
-    val scala3Next = "3.8.4"
+    val scala3 = "3.3.9"
+    val scala3Next = "3.9.0"
+    // The Scala 3 version used to build the sbt 2.x plugin. It must not be newer than the
+    // Scala version sbt 2.x itself is built with (sbt 2.0.x uses 3.8.4), otherwise sbt cannot
+    // read the plugin's TASTy files and loading a build that uses the plugin fails with
+    // "Forward incompatible TASTy file". Keep in sync with sbt 2.x, not with scala3Next.
+    val scala3ForSbtPlugin = "3.8.4"
 
     // the order in the list is important because the head will be considered the default.
     val CrossScalaForLib = Seq(scala213, scala3)
     val CrossScalaForPlugin = Seq(scala212, scala3)
-    val CrossScalaForSbtPlugin = Seq(scala212, scala3Next)
+    val CrossScalaForSbtPlugin = Seq(scala212, scala3ForSbtPlugin)
     val CrossScalaAll = Seq(scala212, scala213, scala3)
 
     // We don't force Pekko updates because downstream projects can upgrade
@@ -36,16 +41,16 @@ object Dependencies {
     val pekkoHttp = PekkoHttpDependency.version
     val pekkoHttpBinary = pekkoHttp.take(3)
 
-    val grpc = "1.83.1" // checked synced by VersionSyncCheckPlugin
+    val grpc = "1.85.1" // checked synced by VersionSyncCheckPlugin
     // Even referenced explicitly in the sbt-plugin's sbt-tests
     // If changing this, remember to update protoc plugin version to align in
     // maven-plugin/src/main/maven/plugin.xml and org.apache.pekko.grpc.sbt.PekkoGrpcPlugin
-    val googleProtoc = "4.36.0" // checked synced by VersionSyncCheckPlugin
-    val googleProtobufJava = "4.36.0"
+    val googleProtoc = "4.36.2" // checked synced by VersionSyncCheckPlugin
+    val googleProtobufJava = "4.36.2"
 
     val scalaTest = "3.2.20"
 
-    val maven = "3.9.16"
+    val maven = "3.10.0"
   }
 
   object Compile {
@@ -65,7 +70,7 @@ object Dependencies {
       .exclude("io.grpc", "grpc-xds")
       .exclude("io.opentelemetry", "opentelemetry-exporter-prometheus")
 
-    val slf4jApi = "org.slf4j" % "slf4j-api" % "2.0.18"
+    val slf4jApi = "org.slf4j" % "slf4j-api" % "2.0.20"
     val mavenPluginApi = "org.apache.maven" % "maven-plugin-api" % Versions.maven
     val mavenCore = "org.apache.maven" % "maven-core" % Versions.maven
     val protocJar = "io.github.blackrock" % "protoc-jar" % "3.0.0"
@@ -89,7 +94,7 @@ object Dependencies {
   }
 
   object Runtime {
-    val logback = "ch.qos.logback" % "logback-classic" % "1.6.3" % "runtime"
+    val logback = "ch.qos.logback" % "logback-classic" % "1.6.6" % "runtime"
   }
 
   object Protobuf {
@@ -109,6 +114,10 @@ object Dependencies {
     Protobuf.protobufJava, // or else scalapb pulls older version in transitively
     Compile.grpcProtobuf,
     Test.scalaTest)
+
+  lazy val scalapbProtocPlugin = l ++= Seq(
+    Compile.scalapbCompilerPlugin,
+    Protobuf.protobufJava) // or else scalapb pulls older version in transitively
 
   lazy val runtime = l ++= Seq(
     Compile.scalapbRuntime,

@@ -13,7 +13,7 @@
 
 package org.apache.pekko.grpc
 import org.apache.pekko
-import pekko.grpc.internal.{ Codecs, Gzip, Identity }
+import pekko.grpc.internal.{ Codecs, Deflate, GrpcProtocolNative, GrpcResponseHelpers, Gzip, Identity }
 import pekko.grpc.scaladsl.headers
 import pekko.http.scaladsl.model.HttpRequest
 import pekko.http.scaladsl.model.headers.RawHeader
@@ -22,15 +22,13 @@ import org.scalatest.matchers.should.Matchers
 import org.scalatest.wordspec.AnyWordSpec
 import org.scalatest.TryValues
 
-import scala.collection.immutable
-
 class CodecsSpec extends AnyWordSpec with Matchers with TryValues {
 
   private def accept(encodings: String*): HttpRequest =
-    HttpRequest(headers = immutable.Seq(headers.`Message-Accept-Encoding`(encodings.mkString(","))))
+    HttpRequest(headers = Seq(headers.`Message-Accept-Encoding`(encodings.mkString(","))))
 
   private def enc(encodings: String*): HttpRequest =
-    HttpRequest(headers = immutable.Seq(headers.`Message-Encoding`(encodings.mkString(","))))
+    HttpRequest(headers = Seq(headers.`Message-Encoding`(encodings.mkString(","))))
 
   "Negotiating message encoding with remote client" should {
 
@@ -63,18 +61,52 @@ class CodecsSpec extends AnyWordSpec with Matchers with TryValues {
     // ModeledCustomHeader types, which would break compression negotiation.
     // Our implementation uses findIn on raw headers instead, which works correctly.
     "negotiate gzip from raw headers (not typed custom headers)" in {
-      val request = HttpRequest(headers = immutable.Seq(RawHeader("grpc-accept-encoding", "gzip")))
+      val request = HttpRequest(headers = Seq(RawHeader("grpc-accept-encoding", "gzip")))
       Codecs.negotiate(request) should be(Gzip)
     }
 
     "negotiate from raw headers with multiple encodings" in {
-      val request = HttpRequest(headers = immutable.Seq(RawHeader("grpc-accept-encoding", "gzip,identity")))
+      val request = HttpRequest(headers = Seq(RawHeader("grpc-accept-encoding", "gzip,identity")))
       Codecs.negotiate(request) should be(Gzip)
     }
 
     "negotiate gzip when grpc-accept-encoding uses comma+space separators (as sent by grpc-go/grpc-python/grpcurl)" in {
-      val request = HttpRequest(headers = immutable.Seq(RawHeader("grpc-accept-encoding", "deflate, gzip")))
+      val request = HttpRequest(headers = Seq(RawHeader("grpc-accept-encoding", "snappy, gzip")))
       Codecs.negotiate(request) should be(Gzip)
+    }
+
+    "accept explicit Deflate" in {
+      Codecs.negotiate(accept(Deflate.name)) should be(Deflate)
+    }
+
+    "respect the order of the client's encodings" in {
+      Codecs.negotiate(accept(Deflate.name, Gzip.name)) should be(Deflate)
+      Codecs.negotiate(accept(Gzip.name, Deflate.name)) should be(Gzip)
+      // as sent by gRPC C-core based clients
+      Codecs.negotiate(accept(Identity.name, Deflate.name, Gzip.name)) should be(Identity)
+      Codecs.negotiate(accept("xxxxx", Deflate.name, Gzip.name)) should be(Deflate)
+    }
+
+    "respect the order of the client's encodings with comma+space separators" in {
+      val request = HttpRequest(headers = Seq(RawHeader("grpc-accept-encoding", "deflate, gzip")))
+      Codecs.negotiate(request) should be(Deflate)
+    }
+
+    "respect the order of encodings across multiple grpc-accept-encoding headers" in {
+      val gzipInSecondHeader = HttpRequest(headers = Seq(
+        RawHeader("grpc-accept-encoding", "xxxxx"),
+        RawHeader("grpc-accept-encoding", "gzip")))
+      Codecs.negotiate(gzipInSecondHeader) should be(Gzip)
+
+      val request = HttpRequest(headers = Seq(
+        RawHeader("grpc-accept-encoding", "xxxxx"),
+        RawHeader("grpc-accept-encoding", "deflate, gzip")))
+      Codecs.negotiate(request) should be(Deflate)
+
+      val gzipFirst = HttpRequest(headers = Seq(
+        RawHeader("grpc-accept-encoding", "gzip"),
+        RawHeader("grpc-accept-encoding", "deflate")))
+      Codecs.negotiate(gzipFirst) should be(Gzip)
     }
 
   }
@@ -93,6 +125,10 @@ class CodecsSpec extends AnyWordSpec with Matchers with TryValues {
       Codecs.detect(enc(Gzip.name)).success.value should be(Gzip)
     }
 
+    "accept explicit Deflate" in {
+      Codecs.detect(enc(Deflate.name)).success.value should be(Deflate)
+    }
+
     "fail with unknown encoding" in {
       val detected = Codecs.detect(enc("xxxxxxx"))
       detected.failure.exception shouldBe a[GrpcServiceException]
@@ -100,9 +136,20 @@ class CodecsSpec extends AnyWordSpec with Matchers with TryValues {
         Status.UNIMPLEMENTED.getCode)
     }
 
+    "list the supported encodings when failing with an unknown encoding" in {
+      val exception = Codecs.detect(enc("xxxxxxx")).failure.exception.asInstanceOf[GrpcServiceException]
+
+      exception.status.getDescription should include("xxxxxxx")
+      exception.metadata.getText("grpc-accept-encoding") should be(Some("gzip,deflate,identity"))
+      // and they reach the response the client gets
+      val response = GrpcResponseHelpers.status(Trailers(exception.status, exception.metadata))(
+        GrpcProtocolNative.newWriter(Identity))
+      headers.`Message-Accept-Encoding`.findIn(response.headers).toSeq should be(Seq("gzip", "deflate", "identity"))
+    }
+
     // Regression test: same as akka-grpc #1897 but for detect path
     "detect encoding from raw headers (not typed custom headers)" in {
-      val request = HttpRequest(headers = immutable.Seq(RawHeader("grpc-encoding", "gzip")))
+      val request = HttpRequest(headers = Seq(RawHeader("grpc-encoding", "gzip")))
       Codecs.detect(request).success.value should be(Gzip)
     }
   }

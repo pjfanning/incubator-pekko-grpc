@@ -19,7 +19,6 @@
 
 package org.apache.pekko.grpc
 
-import scala.collection.immutable
 import scala.concurrent.Await
 import scala.concurrent.ExecutionContext
 import scala.concurrent.Future
@@ -48,6 +47,7 @@ import pekko.http.scaladsl.model.HttpResponse
 import pekko.http.scaladsl.model.StatusCodes
 import pekko.http.scaladsl.model.TransferEncodings
 import pekko.http.scaladsl.model.Uri
+import pekko.http.scaladsl.util.FastFuture
 import pekko.stream.Materializer
 import pekko.stream.SystemMaterializer
 import pekko.stream.scaladsl.Sink
@@ -66,7 +66,11 @@ class ScalaUnaryHandlerBenchmark extends CommonBenchmark {
   private val writer = GrpcProtocolNative.newWriter(Identity)
   private val requestMessage = HelloRequest("Alice")
   private val responseMessage = HelloReply("Hello, Alice")
-  private val implementation = new BenchmarkGreeterService(responseMessage)
+  // A typical service implementation, returning an ordinary completed Future.
+  private val implementation = new BenchmarkGreeterService(Future.successful(responseMessage))
+  // A service implementation that returns an already completed FastFuture, so that every transform
+  // the handler chains onto it can also run directly instead of being scheduled.
+  private val fastImplementation = new BenchmarkGreeterService(FastFuture.successful(responseMessage))
 
   private val request: HttpRequest = {
     val data =
@@ -78,7 +82,7 @@ class ScalaUnaryHandlerBenchmark extends CommonBenchmark {
     HttpRequest(
       method = HttpMethods.POST,
       uri = Uri("https://unused.example/" + GreeterService.name + "/SayHello"),
-      headers = immutable.Seq(
+      headers = Seq(
         `Message-Encoding`(writer.messageEncoding.name),
         `Message-Accept-Encoding`(Codecs.supportedCodecs.map(_.name).mkString(",")),
         pekko.http.scaladsl.model.headers.TE(TransferEncodings.trailers)),
@@ -88,7 +92,7 @@ class ScalaUnaryHandlerBenchmark extends CommonBenchmark {
   private val generatedHandler: HttpRequest => Future[HttpResponse] =
     GreeterServiceHandler(implementation)
 
-  private val oldStyleHandler: HttpRequest => Future[HttpResponse] = {
+  private def oldStyleHandlerFor(implementation: GreeterService): HttpRequest => Future[HttpResponse] = {
     val notFound = Future.successful(HttpResponse(StatusCodes.NotFound))
     val unsupportedMediaType = Future.successful(HttpResponse(StatusCodes.UnsupportedMediaType))
     val spi = TelemetryExtension(system).spi
@@ -117,6 +121,9 @@ class ScalaUnaryHandlerBenchmark extends CommonBenchmark {
       }
   }
 
+  private val oldStyleHandler: HttpRequest => Future[HttpResponse] = oldStyleHandlerFor(implementation)
+  private val fastOldStyleHandler: HttpRequest => Future[HttpResponse] = oldStyleHandlerFor(fastImplementation)
+
   @Benchmark
   def generatedUnaryStrictRequestProcessing(blackhole: Blackhole): Unit =
     consumeResponse(Await.result(generatedHandler(request), Duration.Inf), blackhole)
@@ -124,6 +131,10 @@ class ScalaUnaryHandlerBenchmark extends CommonBenchmark {
   @Benchmark
   def oldStyleUnaryStrictRequestProcessing(blackhole: Blackhole): Unit =
     consumeResponse(Await.result(oldStyleHandler(request), Duration.Inf), blackhole)
+
+  @Benchmark
+  def oldStyleUnaryStrictRequestProcessingFastImplementation(blackhole: Blackhole): Unit =
+    consumeResponse(Await.result(fastOldStyleHandler(request), Duration.Inf), blackhole)
 
   private def consumeResponse(response: HttpResponse, blackhole: Blackhole): Unit = {
     blackhole.consume(response.status)
@@ -139,9 +150,9 @@ class ScalaUnaryHandlerBenchmark extends CommonBenchmark {
   def tearDown(): Unit =
     system.terminate()
 
-  private final class BenchmarkGreeterService(response: HelloReply) extends GreeterService {
+  private final class BenchmarkGreeterService(response: Future[HelloReply]) extends GreeterService {
     override def sayHello(in: HelloRequest): Future[HelloReply] =
-      Future.successful(response)
+      response
 
     override def itKeepsTalking(in: Source[HelloRequest, NotUsed]): Future[HelloReply] =
       throw new UnsupportedOperationException("itKeepsTalking")

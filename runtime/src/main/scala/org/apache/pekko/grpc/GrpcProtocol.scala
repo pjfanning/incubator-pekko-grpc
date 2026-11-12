@@ -18,14 +18,21 @@ import pekko.NotUsed
 import pekko.annotation.InternalApi
 import pekko.annotation.InternalStableApi
 import pekko.grpc.GrpcProtocol.{ GrpcProtocolReader, GrpcProtocolWriter }
-import pekko.grpc.internal.{ Codec, Codecs, GrpcProtocolNative, GrpcProtocolWeb, GrpcProtocolWebText }
+import pekko.grpc.GrpcProtocol.DeferredDataFrame.DeferredDataWriter
+import pekko.grpc.internal.{
+  AbstractGrpcProtocol,
+  Codec,
+  Codecs,
+  GrpcProtocolNative,
+  GrpcProtocolWeb,
+  GrpcProtocolWebText
+}
 import pekko.http.javadsl.{ model => jmodel }
 import pekko.http.scaladsl.model.{ ContentType, HttpHeader, HttpResponse, Trailer }
 import pekko.http.scaladsl.model.HttpEntity.ChunkStreamPart
 import pekko.stream.scaladsl.Flow
 import pekko.util.ByteString
 
-import scala.collection.immutable
 import scala.util.Try
 
 /**
@@ -63,9 +70,11 @@ trait GrpcProtocol {
    *
    * Constructs a protocol reader for reading gRPC protocol frames for this variant.
    * @param codec the compression codec to decode data frame bodies with.
+   * @param maxInboundMessageSize the maximum allowed inbound message size in bytes.
    */
   @InternalStableApi
-  def newReader(codec: Codec): GrpcProtocolReader
+  def newReader(codec: Codec, maxInboundMessageSize: Int = AbstractGrpcProtocol.DefaultMaxInboundMessageSize)
+      : GrpcProtocolReader
 }
 
 /**
@@ -79,11 +88,48 @@ object GrpcProtocol {
   /** A frame in a logical gRPC protocol stream */
   sealed trait Frame
 
-  /** A data (or message) frame in a gRPC protocol stream. */
-  case class DataFrame(data: ByteString) extends Frame
+  /** An outbound data frame to be encoded in a gRPC protocol stream */
+  sealed trait OutboundFrame extends Frame
+
+  /** A frame received from a peer system. */
+  sealed trait InboundFrame extends Frame
+
+  /** A data (or message) frame in a gRPC protocol stream */
+  case class DataFrame(data: ByteString) extends InboundFrame with OutboundFrame
 
   /** A trailer (status headers) frame in a gRPC protocol stream */
-  case class TrailerFrame(trailers: List[HttpHeader]) extends Frame
+  case class TrailerFrame(trailers: List[HttpHeader]) extends InboundFrame with OutboundFrame
+
+  /** An outbound write of a data frame, deferred to allow optimized write into a pre-allocated buffer */
+  case class DeferredDataFrame[T](element: T, writer: DeferredDataWriter[T]) extends OutboundFrame {
+    type Element = T
+
+    /** Fallback to DataFrame style write, when optimized framed write is not possible. */
+    def data: ByteString = {
+      val data = new Array[Byte](writer.serializedSize(element))
+      writer.serializeTo(element, data, 0)
+      ByteString.fromArrayUnsafe(data)
+    }
+
+  }
+
+  object DeferredDataFrame {
+    trait DeferredDataWriter[T] {
+
+      /**
+       * Compute the size of the serialized form of the given element.
+       */
+      private[grpc] def serializedSize(t: T): Int
+
+      /**
+       * Serialize the given element into the given frame, starting at the given offset.
+       * @param t the element to serialize.
+       * @param frame a preallocated frame buffer, which will be at least of size offset + serializedSize(t)
+       * @param offset the offset to place the serialized data of the element at.
+       */
+      private[grpc] def serializeTo(t: T, frame: Array[Byte], offset: Int): Unit
+    }
+  }
 
   /**
    * Implements the encoding of a stream of gRPC Frames into a physical/transport layer.
@@ -96,11 +142,9 @@ object GrpcProtocol {
       /** The compression codec to be used for data frame bodies */
       messageEncoding: Codec,
       /** Encodes a frame as a part in a chunk stream. */
-      encodeFrame: Frame => ChunkStreamPart,
+      encodeFrame: OutboundFrame => ChunkStreamPart,
       /** A shortcut to encode a data frame directly into a Response */
-      encodeDataToResponse: (ByteString, immutable.Seq[HttpHeader], Trailer) => HttpResponse,
-      /** A Flow over a stream of Frame using this frame encoding */
-      frameEncoder: Flow[Frame, ChunkStreamPart, NotUsed])
+      encodeDataToResponse: (OutboundFrame, Seq[HttpHeader], Trailer) => HttpResponse)
 
   /**
    * Implements the decoding of the gRPC framing from a physical/transport layer.
@@ -110,7 +154,7 @@ object GrpcProtocol {
       messageEncoding: Codec,
       decodeSingleFrame: ByteString => ByteString,
       /** A Flow of Frames over a stream of messages encoded in gRPC framing. */
-      frameDecoder: Flow[ByteString, Frame, NotUsed]) {
+      frameDecoder: Flow[ByteString, InboundFrame, NotUsed]) {
 
     /**
      * A Flow of Frames over a stream of messages encoded in gRPC framing that only
@@ -148,8 +192,21 @@ object GrpcProtocol {
    * @return the protocol reader for the request, and a protocol writer for the response.
    */
   def negotiate(request: jmodel.HttpRequest): Option[(Try[GrpcProtocolReader], GrpcProtocolWriter)] =
+    negotiate(request, GrpcServerSettings.defaults)
+
+  /**
+   * Calculates the gRPC protocol encoding to use for an interaction with a gRPC client.
+   *
+   * @param request the client request to respond to.
+   * @param settings the settings of the server handling the request.
+   * @return the protocol reader for the request, and a protocol writer for the response.
+   */
+  def negotiate(
+      request: jmodel.HttpRequest,
+      settings: GrpcServerSettings): Option[(Try[GrpcProtocolReader], GrpcProtocolWriter)] =
     detect(request).map { variant =>
-      (Codecs.detect(request).map(variant.newReader), variant.newWriter(Codecs.negotiate(request)))
+      (Codecs.detect(request).map(variant.newReader(_, settings.maxInboundMessageSize)),
+        variant.newWriter(Codecs.negotiate(request)))
     }
 
 }

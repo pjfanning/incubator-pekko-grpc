@@ -55,3 +55,101 @@ Java
 :    @@snip[RichErrorModelTest](/interop-tests/src/test/java/example/myapp/helloworld/grpc/RichErrorNativeImpl.java) { #rich_error_model_unary }
 
 Please look @ref[here](../client/details.md) how to handle this on the client.
+
+## Message compression
+
+The server supports the `gzip` and `deflate` message encodings of the
+[gRPC compression spec](https://github.com/grpc/grpc/blob/master/doc/compression.md), as well as `identity`.
+
+* Requests compressed with a supported encoding (`grpc-encoding`) are decompressed. Other encodings are rejected
+  with an `UNIMPLEMENTED` status.
+* Responses are compressed with the first supported encoding in the order the client lists them in its
+  `grpc-accept-encoding` headers, or not compressed when the client lists none. For example,
+  `grpc-accept-encoding: deflate, gzip` gives `deflate` responses, and `identity, deflate, gzip` gives uncompressed
+  responses.
+
+## Maximum inbound message size
+
+Inbound gRPC messages are limited to 4 MiB by default, matching the grpc-java default. A frame whose
+declared length exceeds the limit is rejected before its payload is read, and a compressed frame that
+inflates past the limit is rejected while it is being decompressed, so neither an oversized frame nor a
+decompression bomb needs to be buffered in full. In both cases the peer sees a `RESOURCE_EXHAUSTED` status.
+
+The limit is read from `pekko.grpc.server`:
+
+`reference.conf`
+:  @@snip [reference](/runtime/src/main/resources/reference.conf) { #server-defaults }
+
+To raise it for every service in the actor system, override the setting in your `application.conf`:
+
+```hocon
+pekko.grpc.server {
+  max-inbound-message-size = 8388608  # 8 MiB
+}
+```
+
+To use a different limit for a single service, pass @apidoc[GrpcServerSettings] to the generated
+handler's `partial` method:
+
+Scala
+:   ```scala
+    val settings = GrpcServerSettings(system).withMaxInboundMessageSize(8 * 1024 * 1024)
+    val handler = GreeterServiceHandler.partial(
+      new GreeterServiceImpl(),
+      settings = Some(settings))
+    ```
+
+Java
+:   ```java
+    GrpcServerSettings settings =
+        GrpcServerSettings.create(system).withMaxInboundMessageSize(8 * 1024 * 1024);
+    Function<HttpRequest, CompletionStage<HttpResponse>> handler =
+        GreeterServiceHandlerFactory.partial(
+            new GreeterServiceImpl(),
+            GreeterService.name,
+            SystemMaterializer.get(system).materializer(),
+            GrpcExceptionHandler.defaultMapper(),
+            settings,
+            system);
+    ```
+
+@@@ note
+
+The limit did not exist before 2.0.0, so a server that previously accepted messages larger than 4 MiB
+will start rejecting them after upgrading. Raise `pekko.grpc.server.max-inbound-message-size` to keep
+the old behaviour.
+
+Handlers **generated before 2.0.0** call an entry point that has no access to the actor system's
+configuration, so they fall back on the 4 MiB default and `pekko.grpc.server.max-inbound-message-size`
+has no effect on them. Regenerate your sources against 2.0.0 to make the setting apply.
+
+@@@
+
+## Deadlines
+
+A client can tell the server how long it is prepared to wait by sending the `grpc-timeout`
+request header. Generated handlers honour it: when the deadline passes before the service has
+replied, the call is completed with `DEADLINE_EXCEEDED` — the same status the client reports for
+the same call. For a streamed response, the stream is ended with `DEADLINE_EXCEEDED` trailers once
+the deadline passes, and the `Source` the service returned is cancelled.
+
+Both clients send the header when a call has a deadline:
+
+Scala
+:   ```scala
+    val settings = GrpcClientSettings.connectToServiceAt("localhost", 8080)
+      .withDeadline(5.seconds)
+    ```
+
+@@@ note
+
+A `Future` cannot be cancelled, so for a unary or client-streaming call the deadline bounds the
+reply, not the work behind it: a service that has already started an expensive operation keeps
+running it, and only its result is discarded. A streamed response is different, because its
+`Source` is cancelled at the deadline.
+
+@@@
+
+A request that carries no `grpc-timeout`, or one whose value is malformed, is served without a
+deadline. A malformed value is deliberately ignored rather than rejected: the timeout is a hint
+from the peer, and refusing the request outright would be a worse outcome than serving it.

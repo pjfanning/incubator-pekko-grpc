@@ -18,7 +18,7 @@ import pekko.actor.ClassicActorSystemProvider
 import pekko.annotation.{ ApiMayChange, InternalApi }
 import pekko.discovery.{ Discovery, ServiceDiscovery }
 import pekko.discovery.ServiceDiscovery.{ Resolved, ResolvedTarget }
-import pekko.grpc.internal.HardcodedServiceDiscovery
+import pekko.grpc.internal.{ AbstractGrpcProtocol, HardcodedServiceDiscovery }
 import pekko.util.Helpers
 import com.typesafe.config.{ Config, ConfigValueFactory }
 import io.grpc.CallCredentials
@@ -26,7 +26,6 @@ import io.grpc.netty.shaded.io.grpc.netty.NettyChannelBuilder
 import io.grpc.netty.shaded.io.netty.handler.ssl.SslProvider
 import javax.net.ssl.{ SSLContext, TrustManager }
 
-import scala.collection.immutable
 import scala.concurrent.duration.{ Duration, _ }
 import scala.jdk.DurationConverters._
 
@@ -159,7 +158,18 @@ object GrpcClientSettings {
       clientConfiguration.getBoolean("use-tls"),
       getOptionalString(clientConfiguration, "load-balancing-policy"),
       clientConfiguration.getString("backend"),
-      verifyHostname = clientConfiguration.getBoolean("verify-hostname"))
+      maxInboundMessageSize = getIntWithDefault(
+        clientConfiguration,
+        "max-inbound-message-size",
+        AbstractGrpcProtocol.DefaultMaxInboundMessageSize),
+      verifyHostname = clientConfiguration.getBoolean("verify-hostname"),
+      minimumTlsVersion =
+        getOptionalString(clientConfiguration, "minimum-tls-version").map(SSLContextUtils.requireKnownTlsVersion))
+
+  // `fromConfig(Config)` is public API and is called with hand-assembled Configs that do not
+  // necessarily fall back on `pekko.grpc.client."*"`, so a missing key must not fail.
+  private def getIntWithDefault(config: Config, path: String, default: Int): Int =
+    if (config.hasPath(path)) config.getInt(path) else default
 
   private def getOptionalString(config: Config, path: String): Option[String] =
     config.getString(path) match {
@@ -184,7 +194,7 @@ object GrpcClientSettings {
    */
   @InternalApi
   private[grpc] def staticServiceDiscovery(host: String, port: Int) =
-    new HardcodedServiceDiscovery(Resolved(host, immutable.Seq(ResolvedTarget(host, Some(port), None))))
+    new HardcodedServiceDiscovery(Resolved(host, Seq(ResolvedTarget(host, Some(port), None))))
 
 }
 
@@ -208,7 +218,9 @@ final class GrpcClientSettings private (
     val loadBalancingPolicy: Option[String],
     val backend: String,
     val channelBuilderOverrides: NettyChannelBuilder => NettyChannelBuilder = identity,
-    val verifyHostname: Boolean) {
+    val maxInboundMessageSize: Int,
+    val verifyHostname: Boolean,
+    val minimumTlsVersion: Option[String]) {
   require(
     sslContext.isEmpty || trustManager.isEmpty,
     "Configuring the sslContext or the trustManager is mutually exclusive")
@@ -216,6 +228,9 @@ final class GrpcClientSettings private (
     if (sslContext.isDefined) sslProvider.forall(_ == SslProvider.JDK) else true,
     "When sslContext is configured, sslProvider must not set to something different than JDK")
   require(backend == "netty" || backend == "pekko-http", "backend should be 'netty' or 'pekko-http'")
+  require(
+    maxInboundMessageSize > 0,
+    s"maxInboundMessageSize must be positive, was [$maxInboundMessageSize]")
 
   /**
    * If using ServiceDiscovery and no port is returned use this one.
@@ -235,6 +250,11 @@ final class GrpcClientSettings private (
     Option(trustManager).fold(this)(trustManager => copy(useTls = true, trustManager = Option(trustManager)))
 
   def withResolveTimeout(value: FiniteDuration): GrpcClientSettings = copy(resolveTimeout = value)
+
+  /**
+   * Java API: How long to wait for service discovery to resolve the service.
+   */
+  def withResolveTimeout(value: java.time.Duration): GrpcClientSettings = copy(resolveTimeout = value.toScala)
 
   /**
    * When using service discovery, port name is the optional parameter to filter the requests. Looking up a service
@@ -272,6 +292,15 @@ final class GrpcClientSettings private (
     copy(loadBalancingPolicy = Some(loadBalancingPolicy))
 
   /**
+   * Set the minimum TLS protocol version to use. Accepted values: "TLSv1.2", "TLSv1.3".
+   * On older JDKs that do not support the specified version, the connection will fail.
+   * @throws IllegalArgumentException if `version` is not one of the accepted values
+   * @since 2.0.0
+   */
+  def withMinimumTlsVersion(version: String): GrpcClientSettings =
+    copy(minimumTlsVersion = Some(SSLContextUtils.requireKnownTlsVersion(version)))
+
+  /**
    * How many times to retry establishing a connection before failing the client
    * Failure can be monitored using client.stopped and monitoring the Future/CompletionStage.
    * An exponentially increasing backoff is used between attempts.
@@ -290,6 +319,15 @@ final class GrpcClientSettings private (
   @ApiMayChange
   def withBackend(value: String): GrpcClientSettings =
     copy(backend = value)
+
+  /**
+   * Maximum allowed size for inbound gRPC messages (in bytes).
+   * Applies to the decompressed message size. Messages exceeding this limit
+   * will be rejected with RESOURCE_EXHAUSTED status.
+   * @since 2.0.0
+   */
+  def withMaxInboundMessageSize(value: Int): GrpcClientSettings =
+    copy(maxInboundMessageSize = value)
 
   /**
    * Whether to verify the server's hostname against its TLS certificate (RFC 2818).
@@ -319,7 +357,9 @@ final class GrpcClientSettings private (
       loadBalancingPolicy: Option[String] = loadBalancingPolicy,
       backend: String = backend,
       channelBuilderOverrides: NettyChannelBuilder => NettyChannelBuilder = channelBuilderOverrides,
-      verifyHostname: Boolean = verifyHostname)
+      maxInboundMessageSize: Int = maxInboundMessageSize,
+      verifyHostname: Boolean = verifyHostname,
+      minimumTlsVersion: Option[String] = minimumTlsVersion)
       : GrpcClientSettings =
     new GrpcClientSettings(
       callCredentials = callCredentials,
@@ -340,5 +380,7 @@ final class GrpcClientSettings private (
       loadBalancingPolicy = loadBalancingPolicy,
       backend = backend,
       channelBuilderOverrides = channelBuilderOverrides,
-      verifyHostname = verifyHostname)
+      maxInboundMessageSize = maxInboundMessageSize,
+      verifyHostname = verifyHostname,
+      minimumTlsVersion = minimumTlsVersion)
 }

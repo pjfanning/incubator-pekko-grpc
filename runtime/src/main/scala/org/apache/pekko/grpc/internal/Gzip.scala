@@ -13,38 +13,13 @@
 
 package org.apache.pekko.grpc.internal
 
-import java.io.ByteArrayOutputStream
+import java.io.{ InputStream, OutputStream }
 import java.util.zip.{ GZIPInputStream, GZIPOutputStream }
 
-import org.apache.pekko.util.ByteString
-
-object Gzip extends Codec {
+object Gzip extends StreamingZipCodec {
   override val name: String = "gzip"
 
-  override def compress(uncompressed: ByteString): ByteString = {
-    val baos = new ByteArrayOutputStream(uncompressed.size)
-    val gzos = new GZIPOutputStream(baos)
-    try gzos.write(uncompressed.toArrayUnsafe())
-    finally gzos.close()
-    ByteString.fromArrayUnsafe(baos.toByteArray)
-  }
+  override protected def compressingStream(out: OutputStream): OutputStream = new GZIPOutputStream(out)
 
-  override def uncompress(compressed: ByteString): ByteString = {
-    val gzis = new GZIPInputStream(compressed.asInputStream)
-
-    val baos = new ByteArrayOutputStream(compressed.size)
-    val buffer = new Array[Byte](32 * 1024)
-    try {
-      var read = gzis.read(buffer)
-      while (read != -1) {
-        baos.write(buffer, 0, read)
-        read = gzis.read(buffer)
-      }
-    } finally gzis.close()
-    ByteString.fromArrayUnsafe(baos.toByteArray)
-  }
-
-  override def uncompress(compressedBitSet: Boolean, bytes: ByteString): ByteString =
-    if (compressedBitSet) uncompress(bytes)
-    else bytes
+  override protected def decompressingStream(in: InputStream): InputStream = new GZIPInputStream(in)
 }

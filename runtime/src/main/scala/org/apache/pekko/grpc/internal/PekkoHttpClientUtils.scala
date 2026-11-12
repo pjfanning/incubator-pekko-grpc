@@ -23,23 +23,27 @@ import pekko.actor.ClassicActorSystemProvider
 import pekko.annotation.InternalApi
 import pekko.event.LoggingAdapter
 import pekko.grpc.GrpcProtocol.GrpcProtocolReader
-import pekko.grpc.{ GrpcClientSettings, GrpcResponseMetadata, GrpcSingleResponse, ProtobufSerializer }
+import pekko.grpc.scaladsl.headers
+import pekko.grpc.scaladsl.headers.PercentEncoding
+import pekko.grpc.{ GrpcClientSettings, GrpcResponseMetadata, GrpcSingleResponse, ProtobufSerializer, SSLContextUtils }
 import pekko.http.scaladsl.model.HttpEntity.{ Chunk, Chunked, LastChunk, Strict }
 import pekko.http.scaladsl.{ ClientTransport, ConnectionContext, Http, HttpsConnectionContext }
 import pekko.http.scaladsl.model._
 import pekko.http.scaladsl.model.headers.RawHeader
 import pekko.http.scaladsl.settings.ClientConnectionSettings
+import pekko.http.scaladsl.util.FastFuture
 import pekko.stream.{ Materializer, QueueOfferResult }
 import pekko.stream.scaladsl.{ Keep, Sink, Source }
 import pekko.util.ByteString
 import io.grpc.{ CallOptions, MethodDescriptor, Status, StatusRuntimeException }
 
 import javax.net.ssl.{ KeyManager, SSLContext, SSLEngine, TrustManager }
-import scala.collection.immutable
 import scala.concurrent.{ ExecutionContext, Future, Promise }
-import scala.concurrent.duration.DurationLong
+import scala.concurrent.duration.{ DurationLong, FiniteDuration }
+import java.util.concurrent.TimeUnit
 import scala.jdk.FutureConverters._
 import scala.util.{ Failure, Success }
+import scala.util.control.NonFatal
 
 /**
  * INTERNAL API
@@ -71,9 +75,7 @@ object PekkoHttpClientUtils {
     @volatile var roundRobin: Int = 0
     val clientConnectionSettings =
       ClientConnectionSettings(sys).withTransport(ClientTransport.withCustomResolver((host, _) => {
-        settings.overrideAuthority.foreach { authority =>
-          assert(host == authority)
-        }
+        checkAuthority(host, settings)
         settings.serviceDiscovery.lookup(settings.serviceName, settings.resolveTimeout).map { resolved =>
           if (resolved.addresses.isEmpty)
             throw new IllegalStateException(
@@ -184,12 +186,39 @@ object PekkoHttpClientUtils {
           Uri(
             s"${scheme}://${settings.overrideAuthority.getOrElse(settings.serviceName)}/" +
             descriptor.getFullMethodName),
-          GrpcEntityHelpers.metadataHeaders(headers.entries),
+          GrpcEntityHelpers.metadataHeaders(headers.entries) ++ timeoutHeader(options),
           source)
-        applyDeadline(responseToSource(singleRequest(httpRequest), deserializer), options)
+        applyDeadline(
+          responseToSource(
+            httpRequest.uri,
+            singleRequest(httpRequest),
+            deserializer,
+            settings.maxInboundMessageSize,
+            streamingResponse),
+          options)
       }
     }
   }
+
+  /**
+   * INTERNAL API
+   *
+   * The `grpc-timeout` header for a call, so the server can stop work the client has given up
+   * on. `applyDeadline` only bounds the wait on this side; without this header the server has
+   * no way to know there is a deadline at all.
+   *
+   * An expired deadline sends no header: `applyDeadline` fails such a call outright, and a
+   * zero or negative timeout is not representable on the wire.
+   */
+  @InternalApi
+  private[internal] def timeoutHeader(options: CallOptions): List[HttpHeader] =
+    Option(options.getDeadline) match {
+      case None           => Nil
+      case Some(deadline) =>
+        val remaining = deadline.timeRemaining(TimeUnit.NANOSECONDS)
+        if (remaining <= 0) Nil
+        else List(headers.`Timeout`(FiniteDuration(remaining, TimeUnit.NANOSECONDS)))
+    }
 
   /**
    * INTERNAL API
@@ -223,12 +252,36 @@ object PekkoHttpClientUtils {
   /**
    * INTERNAL API
    *
-   * The `SSLContext` to use for the pekko-http backend, from the explicitly configured context,
-   * the configured trust manager, or the JVM default.
+   * Checks that the host being resolved is the authority this client was configured for.
+   *
+   * An `IllegalArgumentException` rather than `assert`: an `AssertionError` is an `Error`, so it
+   * passes through handlers that catch `Exception`, and `assert` is elided entirely under
+   * `-Xdisable-assertions`, which is the calling application's compiler flag to set rather than
+   * ours. The message names both hosts, where `assert` reported only "assertion failed".
    */
   @InternalApi
-  private[grpc] def sslContextFor(settings: GrpcClientSettings): SSLContext =
-    settings.sslContext.getOrElse {
+  private[internal] def checkAuthority(host: String, settings: GrpcClientSettings): Unit =
+    settings.overrideAuthority.foreach { authority =>
+      if (host != authority)
+        throw new IllegalArgumentException(
+          s"Unexpected host [$host] for gRPC client '${settings.serviceName}', " +
+          s"expected the configured override-authority [$authority]")
+    }
+
+  /**
+   * INTERNAL API
+   *
+   * The `SSLContext` to use for the pekko-http backend, from the explicitly configured context,
+   * the configured trust manager, or the JVM default.
+   *
+   * When `minimum-tls-version` is set the context is wrapped so that every `SSLEngine` it
+   * creates enables only protocols at or above that version. Applying it here rather than at
+   * one of the call sites means both the verifying and the `verify-hostname = false`
+   * connection contexts inherit the floor.
+   */
+  @InternalApi
+  private[grpc] def sslContextFor(settings: GrpcClientSettings): SSLContext = {
+    val base = settings.sslContext.getOrElse {
       settings.trustManager match {
         case None               => SSLContext.getDefault
         case Some(trustManager) =>
@@ -237,6 +290,8 @@ object PekkoHttpClientUtils {
           ctx
       }
     }
+    settings.minimumTlsVersion.fold(base)(SSLContextUtils.withMinimumTlsVersion(base, _))
+  }
 
   /**
    * INTERNAL API
@@ -285,7 +340,12 @@ object PekkoHttpClientUtils {
    * INTERNAL API
    */
   @InternalApi
-  def responseToSource[O](response: Future[HttpResponse], deserializer: ProtobufSerializer[O])(
+  def responseToSource[O](
+      requestUri: Uri,
+      response: Future[HttpResponse],
+      deserializer: ProtobufSerializer[O],
+      maxInboundMessageSize: Int = AbstractGrpcProtocol.DefaultMaxInboundMessageSize,
+      streamingResponse: Boolean = false)(
       implicit ec: ExecutionContext,
       mat: Materializer): Source[O, Future[GrpcResponseMetadata]] = {
     Source.lazyFutureSource[O, Future[GrpcResponseMetadata]](() => {
@@ -293,16 +353,17 @@ object PekkoHttpClientUtils {
         {
           if (response.status != StatusCodes.OK) {
             response.entity.discardBytes()
-            val failure = mapToStatusException(response, immutable.Seq.empty)
-            Source.failed(failure).mapMaterializedValue(_ => Future.failed(failure))
+            val failure = mapToStatusException(requestUri, response, Seq.empty)
+            Source.failed(failure).mapMaterializedValue(_ => FastFuture.failed(failure))
           } else {
             Codecs.detect(response) match {
               case Success(codec) =>
-                implicit val reader: GrpcProtocolReader = GrpcProtocolNative.newReader(codec)
-                val trailerPromise = Promise[immutable.Seq[HttpHeader]]()
+                implicit val reader: GrpcProtocolReader =
+                  GrpcProtocolNative.newReader(codec, maxInboundMessageSize)
+                val trailerPromise = Promise[Seq[HttpHeader]]()
                 // Completed with success or failure based on grpc-status and grpc-message trailing headers
                 val completionFuture: Future[Unit] =
-                  trailerPromise.future.flatMap(trailers => parseResponseStatus(response, trailers))
+                  trailerPromise.future.flatMap(trailers => parseResponseStatus(requestUri, response, trailers))
 
                 val responseData =
                   response.entity match {
@@ -316,29 +377,36 @@ object PekkoHttpClientUtils {
                             ByteString.empty
                         }
                         .watchTermination((_, done) =>
-                          done.onComplete(_ => trailerPromise.trySuccess(immutable.Seq.empty)))
+                          done.onComplete(_ => trailerPromise.trySuccess(Seq.empty)))
                     case Strict(_, data) =>
                       val rawTrailers =
-                        response.attribute(AttributeKeys.trailer).map(_.headers).getOrElse(immutable.Seq.empty)
+                        response.attribute(AttributeKeys.trailer).map(_.headers).getOrElse(Seq.empty)
                       val trailers = rawTrailers.map(h => RawHeader(h._1, h._2))
                       trailerPromise.success(trailers)
                       Source.single[ByteString](data)
                     case _ =>
                       response.entity.discardBytes()
-                      throw mapToStatusException(response, Seq.empty)
+                      throw mapToStatusException(requestUri, response, Seq.empty)
                   }
-                responseData
+                val baseFlow = responseData
                   // This never adds any data to the stream, but makes sure it fails with the correct error code if applicable
                   .concat(
                     Source
                       .maybe[ByteString]
                       .mapMaterializedValue(promise => promise.completeWith(completionFuture.map(_ => None))))
-                  // Make sure we continue reading to get the trailing header even if we're no longer interested in the rest of the body
-                  .via(new CancellationBarrierGraphStage)
+                val flow =
+                  if (streamingResponse) {
+                    // Cancellation must reach the server, otherwise the server stream is never stopped
+                    baseFlow
+                  } else {
+                    // Make sure we continue reading to get the trailing header even if we're no longer interested in the rest of the body
+                    baseFlow.via(new CancellationBarrierGraphStage)
+                  }
+                flow
                   .via(reader.dataFrameDecoder)
                   .map(deserializer.deserialize)
                   .mapMaterializedValue(_ =>
-                    Future.successful(new GrpcResponseMetadata() {
+                    FastFuture.successful(new GrpcResponseMetadata() {
                       override def headers: pekko.grpc.scaladsl.Metadata =
                         new HeaderMetadataImpl(response.headers)
 
@@ -355,7 +423,7 @@ object PekkoHttpClientUtils {
                           .asJava
                     }))
               case Failure(e) =>
-                Source.failed[O](e).mapMaterializedValue(_ => Future.failed(e))
+                Source.failed[O](e).mapMaterializedValue(_ => FastFuture.failed(e))
             }
           }
         }
@@ -363,27 +431,64 @@ object PekkoHttpClientUtils {
     })
   }.mapMaterializedValue(_.flatten)
 
-  private def parseResponseStatus(response: HttpResponse, trailers: Seq[HttpHeader]): Future[Unit] = {
+  private def parseResponseStatus(requestUri: Uri, response: HttpResponse, trailers: Seq[HttpHeader]): Future[Unit] = {
     val allHeaders = response.headers ++ trailers
     allHeaders.find(_.name == "grpc-status").map(_.value) match {
       case Some("0") =>
-        Future.successful(())
+        FastFuture.successful(())
       case _ =>
-        Future.failed(mapToStatusException(response, trailers))
+        FastFuture.failed(mapToStatusException(requestUri, response, trailers))
     }
   }
 
-  private def mapToStatusException(response: HttpResponse, trailers: Seq[HttpHeader]): StatusRuntimeException = {
+  private def mapToStatusException(
+      requestUri: Uri,
+      response: HttpResponse,
+      trailers: Seq[HttpHeader]): StatusRuntimeException = {
     val allHeaders = response.headers ++ trailers
-    val metadata: io.grpc.Metadata = new MetadataImpl(new HeaderMetadataImpl(allHeaders).asList).toGoogleGrpcMetadata()
+    val metadata: io.grpc.Metadata = metadataOf(allHeaders)
     allHeaders.find(_.name == "grpc-status").map(_.value) match {
       case None =>
-        new StatusRuntimeException(mapHttpStatus(response).withDescription("No grpc-status found"), metadata)
+        new StatusRuntimeException(
+          mapHttpStatus(response)
+            .withDescription("No grpc-status found")
+            .augmentDescription(s"When calling rpc service: $requestUri"),
+          metadata)
       case Some(statusCode) =>
-        val description = allHeaders.find(_.name == "grpc-message").map(_.value)
-        new StatusRuntimeException(Status.fromCodeValue(statusCode.toInt).withDescription(description.orNull), metadata)
+        // grpc-message travels UTF-8 percent-encoded on the wire, so it has to be decoded
+        // before it reaches the caller. The server side encodes it in `Status-Message`.
+        val description =
+          allHeaders.find(_.name == "grpc-message").map(h => PercentEncoding.Decoder.decode(h.value))
+        val status = statusCodeOf(statusCode) match {
+          case Some(code) =>
+            Status.fromCodeValue(code).withDescription(description.orNull)
+          case None =>
+            // a peer that sends a non-numeric grpc-status is broken, but that is a protocol
+            // error to report, not an exception to throw at the caller
+            Status.INTERNAL.withDescription(s"Invalid grpc-status [$statusCode] in response")
+        }
+        new StatusRuntimeException(status.augmentDescription(s"When calling rpc service: $requestUri"), metadata)
     }
   }
+
+  /**
+   * The response metadata, or empty metadata if a header cannot be represented.
+   *
+   * Binary headers are base64-decoded here, which throws on a malformed value. That is
+   * reachable from any peer, and it happens while building the metadata for an error that is
+   * already being reported, so it must not replace that error with an exception of its own.
+   */
+  private def metadataOf(allHeaders: Seq[HttpHeader]): io.grpc.Metadata =
+    try new MetadataImpl(new HeaderMetadataImpl(allHeaders).asList).toGoogleGrpcMetadata()
+    catch {
+      case NonFatal(_) => new io.grpc.Metadata()
+    }
+
+  private def statusCodeOf(value: String): Option[Int] =
+    try Some(value.toInt)
+    catch {
+      case _: NumberFormatException => None
+    }
 
   /**
    * See https://github.com/grpc/grpc/blob/master/doc/http-grpc-status-mapping.md

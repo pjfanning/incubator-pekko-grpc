@@ -22,7 +22,6 @@ import pekko.http.scaladsl.model.headers.RawHeader
 import pekko.stream.scaladsl.Flow
 import pekko.util.{ ByteString, ByteStringBuilder }
 import io.grpc.{ Status, StatusException }
-import scala.collection.immutable
 
 abstract class GrpcProtocolWebBase(subType: String) extends AbstractGrpcProtocol(subType) {
   protected def postEncode(frame: ByteString): ByteString
@@ -32,29 +31,34 @@ abstract class GrpcProtocolWebBase(subType: String) extends AbstractGrpcProtocol
   override protected def writer(codec: Codec): GrpcProtocolWriter =
     AbstractGrpcProtocol.writer(this, codec, frame => encodeFrame(codec, frame), encodeDataToResponse(codec))
 
-  override protected def reader(codec: Codec): GrpcProtocolReader =
-    AbstractGrpcProtocol.reader(codec, decodeFrame, preDecodeStrict, preDecodeFlow)
+  override protected def reader(codec: Codec, maxInboundMessageSize: Int): GrpcProtocolReader =
+    AbstractGrpcProtocol.reader(codec, decodeFrame, preDecodeStrict, preDecodeFlow, maxInboundMessageSize)
 
-  private def encodeFrame(codec: Codec, frame: Frame): ChunkStreamPart =
+  private def encodeFrame(codec: Codec, frame: OutboundFrame): ChunkStreamPart =
     Chunk(postEncode(encodeFrameToBytes(codec, frame)))
 
   private def encodeDataToResponse(
-      codec: Codec)(data: ByteString, headers: immutable.Seq[HttpHeader], trailer: Trailer): HttpResponse =
+      codec: Codec)(frame: OutboundFrame, headers: Seq[HttpHeader], trailer: Trailer): HttpResponse =
     HttpResponse(
       status = StatusCodes.OK,
       headers = headers,
-      entity = HttpEntity(contentType, encodeDataToFrameBytes(codec, data, trailer)),
+      entity = HttpEntity(contentType, encodeDataToFrameBytes(codec, frame, trailer)),
       protocol = HttpProtocols.`HTTP/1.1`)
 
-  private def encodeDataToFrameBytes(codec: Codec, data: ByteString, trailer: Trailer): ByteString = {
+  private def encodeDataToFrameBytes(codec: Codec, frame: OutboundFrame, trailer: Trailer): ByteString = {
     val trailerData = encodeTrailerHeaders(trailer.headers.iterator)
     val trailerFrame =
       AbstractGrpcProtocol.encodeFrameData(codec.compress(trailerData), codec.isCompressed, isTrailer = true)
-    postEncode(encodeFrameToBytes(codec, DataFrame(data)) ++ trailerFrame)
+    postEncode(encodeFrameToBytes(codec, frame) ++ trailerFrame)
   }
 
-  private def encodeFrameToBytes(codec: Codec, frame: Frame): ByteString =
+  private def encodeFrameToBytes(codec: Codec, frame: OutboundFrame): ByteString =
     frame match {
+      case ef @ DeferredDataFrame(element, dataWriter) =>
+        if (codec eq Identity)
+          AbstractGrpcProtocol.encodeFrameData(element, dataWriter, codec.isCompressed, isTrailer = false)
+        else
+          AbstractGrpcProtocol.encodeFrameData(codec.compress(ef.data), codec.isCompressed, isTrailer = false)
       case DataFrame(data) =>
         AbstractGrpcProtocol.encodeFrameData(codec.compress(data), codec.isCompressed, isTrailer = false)
       case TrailerFrame(trailer) =>
@@ -64,7 +68,7 @@ abstract class GrpcProtocolWebBase(subType: String) extends AbstractGrpcProtocol
           isTrailer = true)
     }
 
-  private final def decodeFrame(frameHeader: Int, data: ByteString): Frame = {
+  private final def decodeFrame(frameHeader: Int, data: ByteString): InboundFrame = {
     (frameHeader & 0x80) match {
       case 0    => DataFrame(data)
       case 0x80 => TrailerFrame(decodeTrailer(data))
